@@ -1,0 +1,1190 @@
+#!/usr/bin/env python
+#
+# Self-contained set of classes and driver code that reads
+# a set of <N> .xlsx files produced by the Stata `putexcel`
+# command and merges then into a single .xslx document.
+#
+# * The sharedStrings arrays from the <N> source files
+#   are consolidated into a single set of unique values
+#   with mappings for each source's string id space to
+#   the consolidated space.
+# * The font, fill, border, and numFmt records from each
+#   of the <N> source's styles are consolidated into a
+#   single set of unique records with mappings for each
+#   source's index space to the consolidated space.
+# * The named styles from the <N> sources are
+#   consolidated into a single set of unique records
+#   with mappings for each source's index space to the
+#   consolidated space.
+# * The full set of cell styles for each source is
+#   retained, with the font, fill, border, numFmt, and
+#   parent named style ids remapped to the final
+#   consolidated spaces.
+# * Worksheets can be read and the string and style
+#   ids remapped to the final consolidated spaces.
+# * The agglomeration of consolidated strings, styles,
+#   and worksheets can be exported to a .xlsx file.
+#
+
+import xml.etree.ElementTree as ET
+import argparse
+import pathlib
+import logging
+import copy
+
+logging.basicConfig(format='%(levelname)s: %(message)s', level=logging.ERROR)
+
+#
+# We'll use Python's built-in 'zipfile' module, but on older
+# Python 3 releases the mkdir() method is not present -- so
+# we'll subclass ZipFile and add that method to it.  Coming
+# out of this section, all zip files should be handled using
+# the ZipFileClass class (which may be that subclass or a
+# reference to the zipfile.ZipFile class itself).
+#
+import zipfile
+if hasattr(zipfile.ZipFile, 'mkdir'):
+    if not callable(getattr(zipfile.ZipFile, 'mkdir')):
+        raise RuntimeError('Current zipfile module defines ZipFile.mkdir but is NOT callable!')
+    # We're okay with this version as-is:
+    ZipFileClass = zipfile.ZipFile
+else:
+    class ZipFileClass(zipfile.ZipFile):
+    
+        def mkdir(self, zinfo_or_directory_name, mode=511):
+            """Creates a directory inside the zip archive."""
+            if isinstance(zinfo_or_directory_name, zipfile.ZipInfo):
+                directory_name = zinfo_or_directory_name.filename
+            elif isinstance(zinfo_or_directory_name, str):
+                directory_name = zinfo_or_directory_name
+            else:
+                raise TypeError("Expected type str or ZipInfo")
+            if not directory_name.endswith('/'):
+                directory_name += '/'
+            zinfo = zipfile.ZipInfo(directory_name)
+            zinfo.compress_size = 0
+            zinfo.CRC = 0
+            zinfo.external_attr = ((0o40000 | mode) & 0xFFFF) << 16
+            zinfo.file_size = 0
+            zinfo.external_attr |= 0x10
+            self.writestr(zinfo, '')
+
+#
+# A subclass of the XML element that adds a source id attribute
+# for the sake of identifying while file the XML object originated
+# in:
+#
+class XLSXMLWrapper(ET.Element):
+
+    def getSrcId(self):
+        if hasattr(self, '__XLSObject_src_id'): return getattr(self, '__XLSObject_src_id')
+        return None
+    def setSrcId(self, src_id):
+        setattr(self, '__XLSObject_src_id', src_id)
+
+
+
+
+#
+# Generic transformation of an XML element into a string representation
+# e.g. for the sake of classes' __str__() methods.
+#
+# Recursive format that looks like:
+#
+#     <tag>             XML element tag
+#     <attr#>           XML element attribute name
+#     <val#>            XML element attribute value
+#     <e{#}>            XML element representation
+#
+#     <e{#}> := <tag>:[<attr1>=<val1>,<attr2>=<val2>,…]{<e1>,<e2>,…}
+#
+def xmlElementToString(e):
+    out_str = e.tag + ':['
+    d = ''
+    attrkeys = [k for k in e.attrib.keys()]
+    attrkeys.sort()
+    for attr in attrkeys:
+        out_str += f'{d}{attr}="{e.attrib[attr]}"'
+        d = ','
+    out_str += ']{'
+    d = ''
+    for c in e:
+        out_str += d + xmlElementToString(c)
+        d = ','
+    out_str += '}'
+    return out_str
+
+#
+# Recursive XML element comparator
+#
+# Returns true if e1 and e2 have the same element tag (sans namespace);
+# the same text body (and trailing text); the same set of attributes
+# and values to those attributes; and the same set of child elements
+# (not necessarily in the same order).
+#
+def xmlElementsEqual(e1, e2):
+    ename1 = e1.tag.split('}')[-1]
+    ename2 = e2.tag.split('}')[-1]
+    if ename1 != ename2 or e1.text != e2.text or e1.tail != e2.tail: return False
+    if e1.attrib != e2.attrib or len(e1) != len(e2): return False
+    c2set = set([c for c in e2])
+    for c1 in e1:
+        found = False
+        for c2 in c2set:
+            if xmlElementsEqual(c1, c2):
+                c2set.remove(c2)
+                found = True
+                break
+        if not found: return False
+    if len(c2set) > 0: return False
+    return True
+
+#
+# Recursive clone of an XML element
+#
+# Creates a deep copy of the element e with the same tag (sans namespace),
+# attributes, and child elements.
+#
+def xmlCopyElement(e):
+    ename = e.tag.split('}')[-1]
+    elem = XLSXMLWrapper(ename)
+    for k,v in e.attrib.items():
+        k = k.split('}')[-1]
+        elem.attrib[k] = v
+    if e.text is not None: elem.text = str(e.text)
+    if e.tail is not None: elem.tail = str(e.tail)
+    for c in e:
+        elem.append(xmlCopyElement(c))
+    return elem
+
+#
+# Object index abstract base class
+#
+# As duplicate metadata are removed, the association between the source
+# .xlsx file's values and the newly-consolidated values must be maintained.
+# Concrete subclasses of XLSObjectIndexMap represent those associations.
+#
+class XLSObjectIndexMap(object):
+
+    # Subclasses must override this with the collection type
+    # that will hold the associations (e.g. list, dict)
+    _use_this_type = None
+    
+    def __init__(self):
+        self._index = self.__class__._use_this_type()
+    
+    def __len__(self): return len(self._index)
+    def __getitem__(self, idx): return self.getMappedIndex(idx)
+    def __setitem__(self, idx, value): return self.setMappedIndex(idx, value)
+    def __iter__(self): return iter(self._index)
+    def __contains__(self, idx): return idx in self._index
+    
+    # Subclasses must override this with a method to retrieve
+    # the consolidated index associated with source index, in_index.
+    def getMappedIndex(self, in_index):
+        pass
+        
+    # Subclasses must override this with a method to set
+    # the consolidated index to_index that is associated with source
+    # index, in_index.
+    def setMappedIndex(self, in_index, to_index):
+        pass
+
+#
+# List-based object index
+#
+# Source indices are assumed to be zero-based and sequential.
+#
+class XLSObjectIndexMapList(XLSObjectIndexMap):
+
+    _use_this_type = list
+    
+    def getMappedIndex(self, in_index):
+        if in_index >= 0 and in_index < len(self._index):
+            return self._index[in_index]
+        raise IndexError(f'Index {in_index} out of range [0,{len(self._index)}) in XLSObjectIndexMapList')
+        
+    def setMappedIndex(self, in_index, to_index):
+        if in_index >= 0 and in_index < len(self._index):
+            self._index[in_index] = to_index            
+        else:
+            while in_index > len(self._index):
+                self._index.append(-1)
+            self._index.append(to_index)
+
+#
+# Dictionary-based object index
+#
+# Source indices can have any value and appear in any order.
+#
+class XLSObjectIndexMapDict(XLSObjectIndexMap):
+
+    _use_this_type = dict
+    
+    def __init__(self, shouldIgnoreMissing=False):
+        self._index = dict()
+        self._shouldIgnoreMissing = shouldIgnoreMissing
+    
+    def getMappedIndex(self, in_index):
+        if in_index in self._index:
+            return self._index[in_index]
+        if self._shouldIgnoreMissing:
+            return in_index
+        raise IndexError(f'Index {in_index} not present in XLSObjectIndexMapDict')
+        
+    def setMappedIndex(self, in_index, to_index):
+        self._index[in_index] = to_index
+        
+
+#
+# Each Excel metadata object has a class associated with
+# it.  That class has a shared and per-source registry of
+# objects.  The shared registry only receives unique
+# objects; the per-source registry associates the original
+# index with the index in the shared registry:
+#
+#     _sharedRegistry = [XLSFont(), XLSFont(), …]
+#     _perSourceRegistry = { 'file1': [ 0, 1, … ],
+#                            'file2': [ 15, 16, … ] }
+#
+# Where the per-source arrays reference the index in the
+# shared registry.
+#
+# Each class _can_ override the shared or per-source registry
+# to use a dictionary rather than an array if objects are NOT
+# indexed sequentially from zero.
+#
+class XLSObject(object):
+
+    # The class should define its own element tag name...
+    _valid_element_tag = None
+
+    @classmethod
+    def getSharedRegistryInstance(cls):
+        return list()
+    @classmethod
+    def getSharedRegistry(cls):
+        if getattr(cls, '_sharedRegistry', None) is None:
+            cls._sharedRegistry = cls.getSharedRegistryInstance()
+        return cls._sharedRegistry
+    @classmethod
+    def nextSharedRegistryIndex(cls):
+        return len(cls.getSharedRegistry())
+        
+    @classmethod
+    def baseExportXMLElement(cls):
+        raise NotImplementedError('Subclasses MUST override the baseExportXMLElement() method')
+        
+    @classmethod
+    def wrapXMLElementForExport(cls, xml_element, shared_index):
+        return xml_element
+        
+    @classmethod
+    def sharedRegistryToXML(cls):
+        root_element = cls.baseExportXMLElement()
+        shared_registry = cls.getSharedRegistry()
+        if isinstance(shared_registry, dict):
+            for k,v in shared_registry.items():
+                root_element.append(cls.wrapXMLElementForExport(v.xmlElementForExport(), k))
+        else:
+            i = 0
+            for v in shared_registry:
+                root_element.append(cls.wrapXMLElementForExport(v.xmlElementForExport(), i))
+                i += 1
+        return root_element
+    
+    @classmethod
+    def incrementTotalCount(cls):
+        if getattr(cls, '_totalCount', None) is None:
+            cls._totalCount = 1
+        else:
+            cls._totalCount += 1
+    @classmethod
+    def getTotalCount(cls):
+        return getattr(cls, '_totalCount', 0)
+
+    @classmethod
+    def getPerSourceRegistryInstance(cls):
+        return XLSObjectIndexMapList()
+    @classmethod
+    def getPerSourceRegistry(cls, src_id):
+        if getattr(cls, '_perSourceRegistry', None) is None:
+            cls._perSourceRegistry = {}
+        if src_id not in cls._perSourceRegistry:
+            cls._perSourceRegistry[src_id] = cls.getPerSourceRegistryInstance()
+        return cls._perSourceRegistry[src_id]
+    @classmethod
+    def proposedPerSourceIndexForXMLElement(cls, src_id, xml_element):
+        return len(cls.getPerSourceRegistry(src_id))
+    
+    @classmethod
+    def sharedIndexForPerSourceIndex(cls, src_id, per_source_index):
+        psr = cls.getPerSourceRegistry(src_id)
+        return psr[per_source_index]
+
+    @classmethod
+    def registerXMLElement(cls, src_id, xml_element):
+        # Attach a source id to the element:
+        new_element = xmlCopyElement(xml_element)
+        new_element.setSrcId(src_id)
+        
+        # Is the incoming object already present in the global
+        # registry?
+        shared_registry = cls.getSharedRegistry()
+        if isinstance(shared_registry, dict):
+            is_present = new_element in shared_registry.values()
+        else:
+            is_present = new_element in shared_registry
+        per_source_index = cls.proposedPerSourceIndexForXMLElement(src_id, new_element)
+        if not is_present:
+            new_object = cls(src_id,
+                            cls.nextSharedRegistryIndex(),
+                            per_source_index,
+                            new_element)
+            shared_index, per_source_index = new_object.indices()
+            if isinstance(shared_registry, dict):
+                shared_registry[shared_index] = new_object
+            else:
+                shared_registry.append(new_object)
+        else:
+            if isinstance(shared_registry, dict):
+                shared_index = None
+                for k,v in shared_registry.items():
+                    if v == new_element:
+                        shared_index = k
+                        break;
+                if shared_index is None:
+                    raise RuntimeError(f'Expected value for a {new_element.tag} not found in shared registry')
+            else:
+                shared_index = shared_registry.index(new_element)
+        cls.incrementTotalCount()
+        cls.getPerSourceRegistry(src_id)[per_source_index] = shared_index
+        
+    def __init__(self, src_id, shared_idx, per_source_idx, xml_element):
+        self._src_id = src_id
+        self._xml_element = xml_element
+        self._shared_index = shared_idx
+        self._per_source_index = per_source_idx
+    
+    def __repr__(self):
+        return xmlElementToString(self._xml_element)
+    
+    def __hash__(self):
+        return hash(xmlElementToString(self._xml_element))
+
+    def __eq__(self, other):
+        if isinstance(other, XLSObject):
+            return xmlElementsEqual(self._xml_element, other._xml_element)
+        return xmlElementsEqual(self._xml_element, other)
+    
+    def srcId(self): return self._src_id
+    def xmlElement(self): return self._xml_element
+    def xmlElementForExport(self): return self.xmlElement()
+    
+    def indices(self): return (self._shared_index, self._per_source_index)
+    def sharedIndex(self): return self._shared_index
+    def perSourceIndex(self): return self._per_source_index
+    
+    def getAttribute(self, name):
+        if name in self._xml_element.attrib:
+            return self._xml_element.attrib[name]
+        raise KeyError(f'No such attribute `{name}` on {self.__class__._valid_element_tag} element')
+    def setAttribute(self, name, value):
+        self._xml_element.attrib[name] = value
+
+
+class XLSString(XLSObject):
+
+    _valid_element_tag = 't'
+        
+    @classmethod
+    def baseExportXMLElement(cls):
+        e = ET.Element('sst')
+        e.attrib['xmlns'] = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+        e.attrib['count'] = str(cls.getTotalCount())
+        e.attrib['uniqueCount'] = str(len(cls.getSharedRegistry()))
+        return e
+        
+    @classmethod
+    def wrapXMLElementForExport(cls, xml_element, shared_index):
+        e = ET.Element('si')
+        e.append(xml_element)
+        return e
+    
+    @classmethod
+    def getFullCount(cls):
+        return cls._fullCount if hasattr(cls, '_fullCount') else 0
+    @classmethod
+    def addToFullCount(cls,  dcount):
+        if not hasattr(cls, '_fullCount'):
+            cls._fullCount = dcount
+        else:
+            cls._fullCount += dcount
+    
+    def __repr__(self): return f'"{self.string()}"'
+    
+    def __hash__(self): return hash(self.string())
+
+    def __eq__(self, other):
+        if isinstance(other, XLSString):
+            return self.string() == other.string()
+        if isinstance(other, ET.Element):
+            return self.string() == other.text
+        return False
+    
+    def string(self): return self._xml_element.text
+    
+class XLSFont(XLSObject):
+
+    _valid_element_tag = 'font'
+        
+    @classmethod
+    def baseExportXMLElement(cls):
+        e = ET.Element('fonts')
+        e.attrib['count'] = str(len(cls.getSharedRegistry()))
+        return e
+    
+    def xmlElementForExport(self):
+        e = self.xmlElement()
+        color_element = e.find('./{*}color[@indexed]')
+        if color_element is not None:
+            e = xmlCopyElement(e)
+            e.attrib['indexed'] = str(XLSIndexedColor.sharedIndexForPerSourceIndex(self.srcId(), int(e.attrib['indexed'])))
+        return e
+    
+class XLSFill(XLSObject):
+
+    _valid_element_tag = 'fill'
+        
+    @classmethod
+    def baseExportXMLElement(cls):
+        e = ET.Element('fills')
+        e.attrib['count'] = str(len(cls.getSharedRegistry()))
+        return e
+    
+class XLSBorder(XLSObject):
+
+    _valid_element_tag = 'border'
+        
+    @classmethod
+    def baseExportXMLElement(cls):
+        e = ET.Element('borders')
+        e.attrib['count'] = str(len(cls.getSharedRegistry()))
+        return e
+    
+class XLSIndexedColor(XLSObject):
+
+    _valid_element_tag = 'rgbColor'
+        
+    @classmethod
+    def baseExportXMLElement(cls):
+        e = ET.Element('indexedColors')
+        e.attrib['count'] = str(len(cls.getSharedRegistry()))
+        return e
+    
+class XLSNumberFormat(XLSObject):
+
+    _valid_element_tag = 'numFmt'
+        
+    @classmethod
+    def baseExportXMLElement(cls):
+        e = ET.Element('numFmts')
+        e.attrib['count'] = str(len(cls.getSharedRegistry()))
+        return e
+        
+    @classmethod
+    def wrapXMLElementForExport(cls, xml_element, shared_index):
+        e = xmlCopyElement(xml_element)
+        e.attrib['numFmtId'] = str(shared_index)
+        return e
+
+    @classmethod
+    def getSharedRegistryInstance(cls):
+        return dict()
+        
+    @classmethod
+    def nextSharedRegistryIndex(cls):
+        registry = cls.getSharedRegistry()
+        if len(registry) == 0: return 0
+        return max(registry) + 1
+
+    @classmethod
+    def getPerSourceRegistryInstance(cls):
+        return XLSObjectIndexMapDict(shouldIgnoreMissing=True)
+
+    @classmethod
+    def proposedPerSourceIndexForXMLElement(cls, src_id, xml_element):
+        registry = cls.getPerSourceRegistry(src_id)
+        if len(registry) == 0: return 0
+        return max(registry) + 1
+        
+    def __init__(self, src_id, shared_idx, per_source_idx, xml_element):
+        super().__init__(src_id, shared_idx, per_source_idx, xml_element)
+        # Override the per-source index with the one that's actually
+        # associated with this object:
+        self._per_source_index = int(self._xml_element.get('numFmtId'))
+        # Also override the shared index with whatever comes next -- or the
+        # per-source index if the shared registry is empty:
+        self._shared_index = self._per_source_index if shared_idx == 0 else shared_idx
+    
+    def __repr__(self): return f'FORMAT<"{self.string()}">'
+    
+    def __hash__(self): return hash(self.formatCode())
+
+    def __eq__(self, other):
+        if isinstance(other, XLSNumberFormat):
+            return self.formatCode() == other.formatCode()
+        if isinstance(other, ET.Element):
+            return self.formatCode() == other.get('formatCode')
+        return False
+    
+    def formatCode(self): return self._xml_element.get('formatCode')
+
+
+class XLSStyleComponentIndices(object):
+
+    def __init__(self, src_id, fontId, fillId, borderId, numFmtId):
+        self._src_id = src_id
+        if src_id is None:
+            raise RuntimeError('shit')
+        self._fontId = int(fontId) if fontId is not None else None
+        self._fillId = int(fillId) if fillId is not None  else None
+        self._borderId = int(borderId) if borderId is not None  else None
+        self._numFmtId = int(numFmtId) if numFmtId is not None  else None
+        
+    def __eq__(self, other):
+        if isinstance(other, XLSStyleComponentIndices):
+            return self.sharedIndices() == other.sharedIndices()
+        return False
+    
+    def __len__(self): return 4
+    def __getitem__(self, key):
+        if key == 0 or key == 'fontId': return self._fontId
+        if key == 1 or key == 'fillId': return self._fillId
+        if key == 2 or key == 'borderId': return self._borderId
+        if key == 3 or key == 'numFmtId': return self._numFmtId
+    
+    def indices(self): return (self._fontId, self._fillId, self._borderId, self._numFmtId)
+    
+    def sharedIndices(self):
+        if not hasattr(self, '_sharedIndices'):
+            # Map each index to its shared entity:
+            try:
+                self._sharedIndices = ( \
+                        XLSFont.sharedIndexForPerSourceIndex(self._src_id, self._fontId) if self._fontId is not None else None, \
+                        XLSFill.sharedIndexForPerSourceIndex(self._src_id, self._fillId) if self._fillId is not None  else None, \
+                        XLSBorder.sharedIndexForPerSourceIndex(self._src_id, self._borderId) if self._borderId is not None  else None, \
+                        XLSNumberFormat.sharedIndexForPerSourceIndex(self._src_id, self._numFmtId) if self._numFmtId is not None  else None)
+            except Exception as E:
+                return (None, None, None, None)
+        return self._sharedIndices
+
+
+class XLSNamedStyle(XLSObject):
+
+    _valid_element_tag = 'xf'
+        
+    @classmethod
+    def baseExportXMLElement(cls):
+        # We override the registry export itself, so we just need
+        # to remove the exception...
+        pass
+        
+    @classmethod
+    def sharedRegistryToXML(cls):
+        shared_registry = cls.getSharedRegistry()
+        n_shared_objects = len(shared_registry)
+        cellStyleXfs_element = ET.Element('cellStyleXfs')
+        cellStyleXfs_element.attrib['count'] = str(n_shared_objects)
+        cellStyles_element = ET.Element('cellStyles')
+        cellStyles_element.attrib['count'] = str(n_shared_objects)
+        i = 0
+        for v in shared_registry:
+            e = v.xmlElementForExport()
+            cellStyleXfs_element.append(e)
+            
+            e = xmlCopyElement(v.nameElement())
+            e.attrib['xfId'] = str(i)
+            cellStyles_element.append(e)
+            i += 1
+        return (cellStyleXfs_element, cellStyles_element)
+    
+    @staticmethod
+    def componentIndicesForXfElement(src_id, xf_element):
+        fontId = int(xf_element.attrib['fontId'])
+        fillId = int(xf_element.attrib['fillId'])
+        borderId = int(xf_element.attrib['borderId'])
+        numFmtId = int(xf_element.attrib['numFmtId'])
+        return XLSStyleComponentIndices(src_id, fontId, fillId, borderId, numFmtId)
+        
+    def __init__(self, src_id, shared_idx, per_source_idx, xml_element):
+        # Remove the name record:
+        self._name_element = xml_element[-1]
+        xml_element.remove(self._name_element)
+        super().__init__(src_id, shared_idx, per_source_idx, xml_element)
+        fontId = int(xml_element.attrib['fontId'])
+        fillId = int(xml_element.attrib['fillId'])
+        borderId = int(xml_element.attrib['borderId'])
+        numFmtId = int(xml_element.attrib['numFmtId'])
+        self._component_indices = XLSStyleComponentIndices(src_id, fontId, fillId, borderId, numFmtId)
+        self._style_name = self._name_element.attrib['name']
+
+    def __repr__(self): return f'NAMED_FORMAT<"{self._indices.sharedIndices()}">'
+    
+    def __hash__(self): return hash(self._indices.sharedIndices())
+
+    def __eq__(self, other):
+        if isinstance(other, XLSNamedStyle):
+            return self.componentIndices().sharedIndices() == other.componentIndices().sharedIndices()
+        if isinstance(other, ET.Element):
+            other_indices = XLSNamedStyle.componentIndicesForXfElement(other.getSrcId(), other)
+            return self.componentIndices().sharedIndices() == other_indices.sharedIndices()
+        return False
+        
+    def xmlElementForExport(self):
+        e = xmlCopyElement(self.xmlElement())
+        indices = self.componentIndices().sharedIndices()
+        if indices[0] is not None: e.attrib['fontId'] = str(indices[0])
+        if indices[1] is not None: e.attrib['fillId'] = str(indices[1])
+        if indices[2] is not None: e.attrib['borderId'] = str(indices[2])
+        if indices[3] is not None: e.attrib['numFmtId'] = str(indices[3])
+        return e
+        
+    def nameElement(self): return self._name_element
+    
+    def componentIndices(self): return self._component_indices
+    
+    def styleName(self): return self._style_name
+
+
+class XLSCellStyle(XLSObject):
+
+    _valid_element_tag = 'xf'
+        
+    @classmethod
+    def baseExportXMLElement(cls):
+        e = ET.Element('cellXfs')
+        e.attrib['count'] = str(len(cls.getSharedRegistry()))
+        return e
+
+    @classmethod
+    def registerXMLElement(cls, src_id, xml_element):
+        # Attach a source id to the element:
+        new_element = xmlCopyElement(xml_element)
+        new_element.setSrcId(src_id)
+        per_source_index = cls.proposedPerSourceIndexForXMLElement(src_id, new_element)
+        
+        # Is the incoming object already present in the global
+        # registry?
+        shared_registry = cls.getSharedRegistry()
+        new_object = cls(src_id,
+                        cls.nextSharedRegistryIndex(),
+                        per_source_index,
+                        new_element)
+        shared_index, per_source_index = new_object.indices()
+        shared_registry.append(new_object)
+        cls.incrementTotalCount()
+        cls.getPerSourceRegistry(src_id)[per_source_index] = shared_index
+
+    def __eq__(self, other):
+        # Retain all of them...
+        return False
+        
+    def __init__(self, src_id, shared_idx, per_source_idx, xml_element):
+        super().__init__(src_id, shared_idx, per_source_idx, xml_element)
+        # Grab the indices to style elements:
+        fontId = xml_element.get('fontId', None)
+        fillId = xml_element.get('fillId', None)
+        borderId = xml_element.get('borderId', None)
+        numFmtId = xml_element.get('numFmtId', None)
+        self._component_indices = XLSStyleComponentIndices(src_id, fontId, fillId, borderId, numFmtId)
+        xfId = xml_element.get('xfId', None)
+        self._xfId = int(xfId) if xfId else None
+    
+    def componentIndices(self): return self._component_indices
+    
+    def resolvedIndicesTuple(self):
+        if not hasattr(self, '_resolvedIndicesTuple'):
+            # First get this source's named font record:
+            component_indices = (None, None, None, None)
+            if self._xfId is not None:
+                named_style_idx = XLSNamedStyle.sharedIndexForPerSourceIndex(self.srcId(), self._xfId)
+                if named_style_idx:
+                    named_style = XLSNamedStyle.getSharedRegistry()[named_style_idx]
+                    if named_style:
+                        component_indices = named_style.componentIndices().sharedIndices()
+            # Fill-in with out own indices:
+            our_shared_indices = self._component_indices.sharedIndices()
+            self._resolvedIndicesTuple = [(o if o is not None else p) for (o, p) in zip(our_shared_indices, component_indices)]
+        return self._resolvedIndicesTuple
+        
+    def xmlElementForExport(self):
+        e = xmlCopyElement(self.xmlElement())
+        indices = self.resolvedIndicesTuple()
+        if indices[0] is not None: e.attrib['fontId'] = str(indices[0])
+        if indices[1] is not None: e.attrib['fillId'] = str(indices[1])
+        if indices[2] is not None: e.attrib['borderId'] = str(indices[2])
+        if indices[3] is not None: e.attrib['numFmtId'] = str(indices[3])
+        if self._xfId is not None:
+            e.attrib['xfId'] = str(XLSNamedStyle.sharedIndexForPerSourceIndex(self.srcId(), self._xfId))
+        return e
+
+
+class XLSWorksheet(object):
+
+    @classmethod
+    def nextMergedWorksheetId(cls):
+        if not hasattr(cls, '_last_merged_worksheet_id'):
+            cls._last_merged_worksheet_id = 1
+            return 1
+        cls._last_merged_worksheet_id += 1
+        return cls._last_merged_worksheet_id
+    @classmethod
+    def lastMergedWorksheetId(cls):
+        if not hasattr(cls, '_last_merged_worksheet_id'):
+            return 0
+        return cls._last_merged_worksheet_id
+    
+    @classmethod
+    def getMergedWorksheets(cls):
+        if not hasattr(cls, '_merged_worksheets'):
+            cls._merged_worksheets = {}
+        return cls._merged_worksheets
+    @classmethod
+    def mergeWorksheet(cls, worksheet):
+        merged_worksheets = cls.getMergedWorksheets()
+        
+        # Make sure the name is unique across all worksheets:
+        suffix = 1
+        while worksheet.name in merged_worksheets:
+            worksheet.name += f' {suffix}'
+            suffix += 1
+        
+        # Make sure the sheet id is unqiue across all worksheets:
+        worksheet.sheetId = cls.nextMergedWorksheetId()
+        
+        merged_worksheets[worksheet.name] = worksheet
+    
+    def __init__(self, src_id, sheet_id, name, xml_doc):
+        self._src_id = src_id
+        self._sheet_id = int(sheet_id)
+        self._name = str(name)
+        self._xml_doc = xml_doc
+    
+    @property
+    def srcId(self): return self._src_id
+    
+    @property
+    def sheetId(self): return self._sheet_id
+    @sheetId.setter
+    def sheetId(self, value):
+        self._sheet_id = int(value)
+    
+    @property
+    def name(self): return self._name
+    @name.setter
+    def name(self, value):
+        self._name = value
+    
+    @property
+    def xmlDoc(self): return self._xml_doc
+    
+    def xmlForExport(self):
+        new_xml_doc = xmlCopyElement(self._xml_doc)
+        new_xml_doc.attrib['xmlns'] = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+        new_xml_doc.attrib['xmlns:r'] = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+        
+        # Find every string and fill-in the references:
+        for string_elem in new_xml_doc.findall(".//{*}*[@t='s']/v"):
+            # Lookup global id:
+            string_id = XLSString.sharedIndexForPerSourceIndex(self._src_id, int(string_elem.text))
+            string_elem.text = str(string_id)
+        
+        # Find every element with a [s]tyle reference:
+        for elem in new_xml_doc.findall(".//{*}*[@s]"):
+            # Lookup global id:
+            style_id = XLSCellStyle.sharedIndexForPerSourceIndex(self._src_id, int(elem.attrib['s']))
+            elem.attrib['s'] = str(style_id)
+        
+        # Find every element with a [s]tyle reference:
+        for elem in new_xml_doc.findall(".//{*}*[@style]"):
+            # Lookup global id:
+            style_id = XLSCellStyle.sharedIndexForPerSourceIndex(self._src_id, int(elem.attrib['style']))
+            elem.attrib['style'] = str(style_id)
+        
+        return new_xml_doc
+
+
+class XLSSourceFile(object):
+
+    def __init__(self, file_path, src_id=None):
+        self.zf = ZipFileClass(file_path, mode='r')
+        self.file_path = str(file_path)
+        self.src_id = src_id if src_id else file_path
+        self._style_xml = None
+    
+        # Read the workbook document to get a list of all the worksheets
+        # et al.
+        self._worksheets = {}
+        with self.zf.open('xl/workbook.xml') as zfptr:
+            self._workbook_xml = ET.ElementTree().parse(zfptr)
+            if self._workbook_xml is not None:
+                self._worksheets_xml = [xmlCopyElement(x) for x in self._workbook_xml.findall('./{*}sheets/{*}sheet')]
+                    
+    def importWorksheets(self):
+        n_sheets = 0
+        for ws_spec in self._worksheets_xml:
+            sheet_id = int(ws_spec.get('sheetId'))
+            sheet_name = ws_spec.get('name')
+            zip_path = f'xl/worksheets/sheet{sheet_id}.xml'
+            with self.zf.open(zip_path) as zfptr:
+                new_worksheet = XLSWorksheet(self.src_id, sheet_id, sheet_name, ET.ElementTree().parse(zfptr))
+                self._worksheets[sheet_id] = new_worksheet
+                XLSWorksheet.mergeWorksheet(new_worksheet)
+                n_sheets += 1
+        logging.info('    - Finished processing worksheets in %s:', str(self.src_id))
+        logging.info('        - %d worksheets in file', n_sheets)
+        
+    def __importStyleXML(self):
+        if self._style_xml is None:
+            with self.zf.open('xl/styles.xml') as zfptr:
+                self._style_xml = ET.ElementTree().parse(zfptr)
+        return self._style_xml
+    
+    def importSharedStrings(self):
+        with self.zf.open('xl/sharedStrings.xml') as zfptr:
+            n_in_file = -1
+            n_found = 0
+            n_unique = len(XLSString.getSharedRegistry())
+            for event, elem in ET.iterparse(zfptr, events=('start', 'end')):
+                ename = elem.tag.split('}')[-1]
+                if event == 'start' and ename == 'sst':
+                    XLSString.addToFullCount(int(elem.get('count')))
+                    n_in_file = int(elem.get('uniqueCount'))
+                elif event == 'end' and ename == 't':
+                    XLSString.registerXMLElement(self.src_id, elem)
+                    n_found += 1
+                if event == 'end':
+                    # Clear the element and its predecessors to free memory
+                    elem.clear()
+            if n_in_file != n_found:
+                raise RuntimeError(f'Expected {n_in_file} strings in source `{self.src_id}`; found {n_found}')
+            logging.info('    - Finished processing shared strings in %s:', str(self.src_id))
+            logging.info('        - %d objects in file', n_in_file)
+            logging.info('        - %d unique objects added to dictionary', len(XLSString.getSharedRegistry())-n_unique)
+    
+    def importSharedStyles(self):
+        classes = { 'numFmts': XLSNumberFormat,
+                    'fonts': XLSFont,
+                    'fills': XLSFill,
+                    'borders': XLSBorder,
+                    'indexedColors': XLSIndexedColor
+                }
+            
+        # Pull the whole thing into memory:
+        doc_root = self.__importStyleXML()
+
+        for format_kind in ('numFmts', 'fonts', 'fills', 'borders', 'indexedColors'):
+            format_root = doc_root.find('./{*}' + format_kind)
+            if format_root is not None:
+                n_expected = int(format_root.get('count', 0))
+                n_found = 0
+                obj_class = classes[format_kind]
+                n_unique = len(obj_class.getSharedRegistry())
+                for format_item in format_root:
+                    obj_class.registerXMLElement(self.src_id, format_item)
+                    n_found += 1
+                if n_expected != n_found:
+                    raise RuntimeError(f'Expected {n_expected} {format_kind} in source `{self.src_id}`; found {n_found}')
+                logging.info('    - Finished processing %s in %s:', format_kind, str(self.src_id))
+                logging.info('        - %d total objects in file', n_expected)
+                logging.info('        - %d unique objects added to dictionary', len(obj_class.getSharedRegistry())-n_unique)
+
+    def importNamedStyles(self):
+        # Pull the whole thing into memory:
+        doc_root = self.__importStyleXML()
+        
+        named_styles_root = doc_root.find('./{*}cellStyleXfs')
+        if named_styles_root is not None:
+            n_expected = int(named_styles_root.get('count', 0))
+            n_found = 0
+            n_unique = len(XLSNamedStyle.getSharedRegistry())
+            #
+            # We're going to walk the <xf> records but also pull
+            # the name record for each, then bundle them into
+            # a pseudo-element of tag <named-xf> for the
+            # XLSNamedStyle class:
+            #
+            for named_style in named_styles_root:
+                name_element = doc_root.find(f"./{{*}}cellStyles/{{*}}cellStyle[@xfId='{n_found}']")
+                if name_element is None:
+                    raise RuntimeError(f'No style name record for named style index {n_found}')
+                named_style.append(name_element)
+                XLSNamedStyle.registerXMLElement(self.src_id, named_style)
+                n_found += 1
+            if n_expected != n_found:
+                raise RuntimeError(f'Expected {n_expected} named styles in source `{self.src_id}`; found {n_found}')
+            logging.info('    - Finished processing named styles in %s:', str(self.src_id))
+            logging.info('        - %d total objects in file', n_expected)
+            logging.info('        - %d unique objects added to dictionary', len(XLSNamedStyle.getSharedRegistry())-n_unique)
+    
+    def importCellStyles(self):
+        # Pull the whole thing into memory:
+        doc_root = self.__importStyleXML()
+        
+        cell_styles_root = doc_root.find('./{*}cellXfs')
+        if cell_styles_root is not None:
+            n_expected = int(cell_styles_root.get('count', 0))
+            n_found = 0
+            n_unique = len(XLSCellStyle.getSharedRegistry())
+            #
+            # We're going to walk the <xf> records but also pull
+            # the name record for each, then bundle them into
+            # a pseudo-element of tag <named-xf> for the
+            # XLSNamedStyle class:
+            #
+            for cell_style in cell_styles_root:
+                XLSCellStyle.registerXMLElement(self.src_id, cell_style)
+                n_found += 1
+            if n_expected != n_found:
+                raise RuntimeError(f'Expected {n_expected} cell styles in source `{self.src_id}`; found {n_found}')
+            logging.info('    - Finished processing cell styles in %s:', str(self.src_id))
+            logging.info('        - %d total objects in file', n_expected)
+            logging.info('        - %d unique objects added to dictionary', len(XLSCellStyle.getSharedRegistry())-n_unique)
+                
+
+class XLSRIDHelper(object):
+    
+    def __init__(self):
+        self._r_id = 0
+        self._obj_index = []
+    
+    def addObject(self, obj):
+        self._r_id += 1
+        self._obj_index.append(obj)
+        return f'rId{self._r_id}'
+    
+    def rIdForObject(self, obj):
+        try:
+            return f'rId{1 + self._obj_index.index(obj)}'
+        except:
+            raise ValueError('No such object in XLSRIHelper.')
+        
+
+
+
+class XLSExportFile(object):
+
+    def __init__(self, file_path, open_mode='w'):
+        self._file_path = str(file_path)
+        self._open_mode = str(open_mode)
+        self._sources_by_path = {}
+        self._sources_by_id = {}
+        self._id_sequence = []
+    
+    def addSource(self, xls_source):
+        if xls_source.file_path in self._sources_by_path:
+            raise RuntimeError(f'Attempt to add duplicate source file `{xls_source.file_path}` to export file')
+        if xls_source.src_id in self._sources_by_id:
+            raise RuntimeError(f'Attempt to add duplicate source id `{xls_source.src_id}` to export file')
+
+        self._sources_by_path[xls_source.file_path] = xls_source
+        self._sources_by_id[xls_source.src_id] = xls_source
+        self._id_sequence.append(xls_source.src_id)
+    
+    def exportXML(self):
+        with ZipFileClass(self._file_path, mode=self._open_mode, compression=zipfile.ZIP_DEFLATED) as zfptr:
+            zfptr.mkdir('_rels')
+            zfptr.mkdir('xl')
+            zfptr.mkdir('xl/_rels')
+            zfptr.mkdir('xl/worksheets')
+            logging.info('    - Created directory structure')
+            
+            rId_map = XLSRIDHelper()
+            
+            # Get the second-level relationships file going:
+            relationships_xml = ET.Element('Relationships')
+            relationships_xml.attrib['xmlns'] = 'http://schemas.openxmlformats.org/package/2006/relationships'
+            
+            # Collate all the shared style bits:
+            cellStyleXfs, cellStyles = XLSNamedStyle.sharedRegistryToXML()
+            stylesheet_xml = ET.Element('styleSheet')
+            stylesheet_xml.attrib['xmlns'] = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+            stylesheet_xml.append(XLSNumberFormat.sharedRegistryToXML())
+            stylesheet_xml.append(XLSFont.sharedRegistryToXML())
+            stylesheet_xml.append(XLSFill.sharedRegistryToXML())
+            stylesheet_xml.append(XLSBorder.sharedRegistryToXML())
+            stylesheet_xml.append(cellStyleXfs)
+            stylesheet_xml.append(XLSCellStyle.sharedRegistryToXML())
+            stylesheet_xml.append(cellStyles)
+            zfptr.writestr('xl/styles.xml',
+                ET.tostring(stylesheet_xml, 
+                        encoding='UTF-8',
+                        xml_declaration='xml')
+                    )
+            logging.info('    - Wrote xl/styles.xml')
+            e = ET.SubElement(relationships_xml, 'Relationship')
+            e.attrib['Target'] = 'styles.xml'
+            e.attrib['Type'] = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles'
+            e.attrib['Id'] = rId_map.addObject(stylesheet_xml)
+            
+            # Get the workbook created:
+            workbook_xml = ET.Element('workbook')
+            workbook_xml.attrib['xmlns:r'] = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+            workbook_xml.attrib['xmlns'] = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+            workbook_xml.append(ET.Element('workbookPr'))
+            bookViews_xml = ET.SubElement(workbook_xml, 'bookViews')
+            workbookView_xml = ET.SubElement(bookViews_xml, 'workbookView')
+            workbookView_xml.attrib['activeTab'] = '0'
+            
+            # Get the content types created:
+            contenttypes_xml = ET.Element('Types')
+            #contenttypes_rId = rId_map.addObject(contenttypes_xml)
+            contenttypes_xml.attrib['xmlns'] = 'http://schemas.openxmlformats.org/package/2006/content-types'
+            e = ET.SubElement(contenttypes_xml, 'Default')
+            e.attrib['Extension'] = 'rels'
+            e.attrib['ContentType'] = 'application/vnd.openxmlformats-package.relationships+xml'
+            e = ET.SubElement(contenttypes_xml, 'Default')
+            e.attrib['Extension'] = 'xml'
+            e.attrib['ContentType'] = 'application/xml'
+            e = ET.SubElement(contenttypes_xml, 'Override')
+            e.attrib['ContentType'] = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml'
+            e.attrib['PartName'] = '/xl/workbook.xml'
+            e = ET.SubElement(contenttypes_xml, 'Override')
+            e.attrib['ContentType'] = 'application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml'
+            e.attrib['PartName'] = '/xl/styles.xml'
+
+            # Export each of the worksheets:
+            first_pass = True
+            sheets_xml = ET.SubElement(workbook_xml, 'sheets')
+            for name, worksheet in XLSWorksheet.getMergedWorksheets().items():
+                rId = rId_map.addObject(worksheet)
+                sheet_ref = ET.SubElement(sheets_xml, 'sheet')
+                sheet_ref.attrib['sheetId'] = str(worksheet.sheetId)
+                sheet_ref.attrib['name'] = name
+                sheet_ref.attrib['r:id'] = rId
+                
+                ws_path = f'xl/worksheets/sheet{worksheet.sheetId}.xml'
+                e = ET.SubElement(contenttypes_xml, 'Override')
+                e.attrib['ContentType'] = 'application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml'
+                e.attrib['PartName'] = '/' + ws_path
+                
+                zfptr.writestr(ws_path,
+                    ET.tostring(worksheet.xmlForExport(),
+                            encoding='UTF-8',
+                            xml_declaration='xml')
+                        )
+                logging.info('    - Wrote worksheet %s', ws_path)
+                e = ET.SubElement(relationships_xml, 'Relationship')
+                e.attrib['Target'] = f'worksheets/sheet{worksheet.sheetId}.xml'
+                e.attrib['Type'] = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet'
+                e.attrib['Id'] = rId
+                
+                if first_pass:
+                    e = ET.SubElement(contenttypes_xml, 'Override')
+                    e.attrib['ContentType'] = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml'
+                    e.attrib['PartName'] = '/xl/sharedStrings.xml'
+                    
+                    # Export the shared strings next:
+                    shared_strings = XLSString.sharedRegistryToXML()
+                    shared_strings.attrib['count'] = str(XLSString.getFullCount())
+                    if shared_strings is not None:
+                        zfptr.writestr('xl/sharedStrings.xml',
+                            ET.tostring(shared_strings, 
+                                    encoding='UTF-8',
+                                    xml_declaration='xml')
+                                )
+                        logging.info('    - Wrote xl/sharedStrings.xml')
+                        e = ET.SubElement(relationships_xml, 'Relationship')
+                        e.attrib['Target'] = 'sharedStrings.xml'
+                        e.attrib['Type'] = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings'
+                        e.attrib['Id'] = rId_map.addObject(shared_strings)
+                    first_pass = False
+            
+            # Export the workbook:
+            calcPr_xml = ET.SubElement(workbook_xml, 'calcPr')
+            calcPr_xml.attrib['calcId'] = '125725'
+            calcPr_xml.attrib['fullCalcOnLoad'] = 'true'
+            zfptr.writestr(f'xl/workbook.xml',
+                    ET.tostring(workbook_xml,
+                            encoding='UTF-8',
+                            xml_declaration='xml').replace(b'\n', b'')
+                        )
+            logging.info('    - Wrote xl/workbook.xml')
+            
+            # Export the [Content_Types].xml:
+            zfptr.writestr(f'[Content_Types].xml',
+                    ET.tostring(contenttypes_xml,
+                            encoding='UTF-8',
+                            xml_declaration='xml').replace(b'\n', b'')
+                        )
+            logging.info('    - Wrote [Content_Type].xml')
+            
+            # Top-level relationships file:
+            rel_str = '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="xl/workbook.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Id="rId1"/></Relationships>'
+            zfptr.writestr(f'_rels/.rels', rel_str)
+            logging.info('    - Wrote _rels/.rels')
+            
+            # Second-level relationships file:
+            zfptr.writestr('xl/_rels/workbook.xml.rels',
+                    ET.tostring(relationships_xml,
+                            encoding='UTF-8',
+                            xml_declaration='xml').replace(b'\n', b'')
+                        )
+            logging.info('    - Wrote xl/_rels/workbook.xml.rels')
+
+
+
+cli_parser = argparse.ArgumentParser(
+                    description='Merge multiple Stata-generated .xslx files')
+cli_parser.add_argument('sources', metavar='<source-file-path>',
+                nargs='+',
+                type=pathlib.Path,
+                help='a .xlsx source file to be merged')
+cli_parser.add_argument('--verbose', '-v',
+                dest='should_be_verbose',
+                default=False,
+                action='store_true',
+                help='produce additional output as the script runs')
+cli_parser.add_argument('--one-is-okay', '-1',
+                dest='is_one_okay',
+                default=False,
+                action='store_true',
+                help='go ahead with the merge even if just one source file is provided')
+cli_parser.add_argument('--output', '-o', metavar='<output-file-path>',
+                dest='outfile',
+                required=True,
+                type=pathlib.Path,
+                help='the .xlsx output file to create (any existing file will be overwritten)')
+
+cli_args = cli_parser.parse_args()
+
+if cli_args.should_be_verbose:
+    logging.getLogger().setLevel(logging.INFO)
+
+if len(cli_args.sources) == 1 and not cli_args.is_one_okay:
+    logging.error('What is the point of merging just a single source file?')
+    logging.error('(If you really want to do that, use the --one-is-okay flag)')
+    exit(1)
+
+srcs = []
+for src_file in cli_args.sources:
+    this_src = XLSSourceFile(src_file)
+    srcs.append(this_src)
+
+    logging.info('Importing shared strings from %s:', src_file)
+    this_src.importSharedStrings()
+    logging.info('Importing shared styles from %s:', src_file)
+    this_src.importSharedStyles()
+    logging.info('Importing named styles from %s:', src_file)
+    this_src.importNamedStyles()
+    logging.info('Importing cell styles from %s:', src_file)
+    this_src.importCellStyles()
+    logging.info('Importing worksheets from %s:', src_file)
+    this_src.importWorksheets()
+
+logging.info('Exporting %d source documents to %s:', len(srcs), cli_args.outfile)
+out_xml = XLSExportFile(cli_args.outfile)
+if out_xml:
+    out_xml.exportXML()
+    logging.info('Done!')
